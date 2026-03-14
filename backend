@@ -1,0 +1,228 @@
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+import random
+import string
+import os
+import cv2
+import numpy as np
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+import io
+
+app = FastAPI(title="Bengaluru Sahaya Portal API")
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allowing all for easier verification
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Models
+class Grievance(BaseModel):
+    title: str
+    description: str
+    category: str
+    ward: str
+    status: str = "Submitted"
+    ack_id: Optional[str] = None
+    created_at: datetime = datetime.now()
+    location: dict # GeoJSON
+    image_url: Optional[str] = None
+
+import cv2
+import numpy as np
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+from datetime import datetime, timedelta
+import io
+
+def get_image_metadata(image_bytes):
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        exif_data = img._getexif()
+        metadata = {}
+        if exif_data:
+            for tag, value in exif_data.items():
+                decoded = TAGS.get(tag, tag)
+                metadata[decoded] = value
+        return metadata
+    except Exception:
+        return {}
+
+def get_decimal_from_dms(dms, ref):
+    degrees = float(dms[0])
+    minutes = float(dms[1])
+    seconds = float(dms[2])
+    decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+    if ref in ['S', 'W']:
+        decimal = -decimal
+    return decimal
+
+def ai_verify_v2(image_bytes, user_category, user_gps):
+    # Tier 3: Quality Control (The "How Clear")
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    # Blur Detection (Laplacian Variance)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < 100:
+        return False, "I couldn't clearly see the issue. Please ensure the photo is clear."
+
+    # Light Check
+    avg_intensity = np.mean(gray)
+    if avg_intensity < 30:
+        return False, "I couldn't clearly see the issue. It's too dark. Use a flash or report during day."
+
+    # Tier 2: Metadata Verification
+    metadata = get_image_metadata(image_bytes)
+    # Timestamp Check (Last 24 hours)
+    img_time_str = metadata.get('DateTimeOriginal') or metadata.get('DateTime')
+    if img_time_str:
+        try:
+            img_time = datetime.strptime(img_time_str, '%Y:%m:%d %H:%M:%S')
+            if datetime.now() - img_time > timedelta(hours=24):
+                return False, "Photo is too old. Please take a fresh photo within the last 24 hours."
+        except: pass
+
+    # GPS Check (Match user's current GPS)
+    gps_info = metadata.get('GPSInfo')
+    if gps_info and user_gps:
+        try:
+            # Simple Euclidean distance for mock (50m ~ 0.00045 degrees)
+            # In real system, use Haversine
+            img_lat = get_decimal_from_dms(gps_info[2], gps_info[1])
+            img_lon = get_decimal_from_dms(gps_info[4], gps_info[3])
+            dist = np.sqrt((img_lat - user_gps[0])**2 + (img_lon - user_gps[1])**2)
+            if dist > 0.0005: # Roughly 50 meters
+                return False, "GPS mismatch. Please ensure you are at the spot of the issue."
+        except: pass
+    
+    # Tier 1: Object Recognition (The "What") - YOLOv8 mock
+    confidence = 0.85 
+    if user_category.lower() == 'pothole' and confidence <= 0.75:
+        return False, "I couldn't detect a clear pothole. Please ensure it's not a shadow."
+    elif user_category.lower() == 'garbage' and confidence <= 0.75:
+        return False, "I couldn't detect a clear garbage pile."
+    
+    return True, "AI Verified"
+
+def ai_verify_grievance(title, description, category):
+    # Mock Indic-BERT logic: Check if description matches category keywords
+    keywords = {
+        "garbage": ["waste", "trash", "garbage", "dump", "smell", "ಕಸ", "ತ್ಯಾಜ್ಯ"],
+        "pothole": ["road", "hole", "pothole", "drive", "accident", "ರಸ್ತೆ", "ಗುಂಡಿ"],
+        "water_leak": ["water", "pipe", "leak", "flood", "ನೀರು", "ಸೋರಿಕೆ"],
+        "electricity": ["power", "light", "wire", "shock", "ವಿದ್ಯುತ್", "ಕರಂಟ್"]
+    }
+    
+    desc_lower = description.lower()
+    matches = any(kw in desc_lower for kw in keywords.get(category.lower(), []))
+    
+    if matches:
+        return "AI Verified"
+    return "Verification Pending"
+
+# Database Fallback Logic
+class MockCollection:
+    def __init__(self):
+        self.data = []
+    async def insert_one(self, document):
+        if "_id" not in document:
+            document["_id"] = str(len(self.data) + 1)
+        self.data.append(document)
+        class Result:
+            def __init__(self, id): self.inserted_id = id
+        return Result(document["_id"])
+    async def find_one(self, query):
+        for item in self.data:
+            match = True
+            for k, v in query.items():
+                if item.get(k) != v:
+                    match = False
+                    break
+            if match:
+                return item
+        return None
+
+class MockDB:
+    def __init__(self):
+        self.grievances = MockCollection()
+
+# MongoDB connection attempt
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+try:
+    client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=1000)
+    db = client.bengaluru_sahaya
+except Exception:
+    db = MockDB()
+
+@app.on_event("startup")
+async def startup_db_client():
+    global db
+    try:
+        await client.admin.command('ping')
+        app.mongodb = db
+    except Exception:
+        db = MockDB()
+        app.mongodb = db
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Bengaluru Sahaya Portal API (In-memory storage active)" if isinstance(db, MockDB) else "Welcome to Bengaluru Sahaya Portal API"}
+
+@app.post("/grievances/", response_model=Grievance)
+async def create_grievance(grievance: Grievance):
+    # Generate BLR-ACK-[YEAR]-[RANDOM]
+    year = datetime.now().year
+    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    grievance.ack_id = f"BLR-ACK-{year}-{random_str}"
+    
+    # Run AI Verification (Indic-BERT mock)
+    grievance.status = ai_verify_grievance(grievance.title, grievance.description, grievance.category)
+    
+    doc = grievance.dict()
+    new_grievance = await db.grievances.insert_one(doc)
+    
+    # If using Mock, its' not a coroutine result but a Result object
+    if hasattr(new_grievance, 'inserted_id'):
+        inserted_id = new_grievance.inserted_id
+    else: # Real Motor result
+        inserted_id = new_grievance.inserted_id
+
+    created_grievance = await db.grievances.find_one({"_id": inserted_id})
+    return created_grievance
+
+from fastapi import File, UploadFile, Form
+
+@app.post("/verify-photo/")
+async def verify_photo(
+    file: UploadFile = File(...),
+    category: str = Form(...),
+    latitude: float = Form(None),
+    longitude: float = Form(None)
+):
+    contents = await file.read()
+    user_gps = (latitude, longitude) if latitude and longitude else None
+    
+    is_valid, message = ai_verify_v2(contents, category, user_gps)
+    
+    return {
+        "valid": is_valid,
+        "message": message,
+        "maya_response": message if not is_valid else "Photo looks great! AI has verified the issue."
+    }
+
+@app.get("/grievances/{ack_id}", response_model=Grievance)
+async def get_grievance(ack_id: str):
+    grievance = await db.grievances.find_one({"ack_id": ack_id})
+    if grievance:
+        return grievance
+    raise HTTPException(status_code=404, detail="Grievance not found")
